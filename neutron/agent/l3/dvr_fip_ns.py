@@ -14,6 +14,7 @@
 
 import contextlib
 import os
+import random
 
 from neutron_lib import constants as lib_constants
 from neutron_lib.utils import runtime
@@ -47,6 +48,10 @@ FIP_PR_END = FIP_PR_START + 40000
 # Fixed rule priority for Fast Path Exit rules
 FAST_PATH_EXIT_PR = 80000
 
+
+EWVA_INTERFACE_PREFIX = 'vlan'
+EWVA_BRIDGE_EXTERNAL = 'br-internet'
+EWVA_SYSCTL_IPV4_IF_PROXY_ARP = 'net.ipv4.conf.%s.proxy_arp=%s'
 
 class FipNamespace(namespaces.Namespace):
 
@@ -121,6 +126,13 @@ class FipNamespace(namespaces.Namespace):
                     LOG.error('DVR: FIP namespace config failure '
                               'for interface %s', interface_name)
 
+    def _generate_random_mac(self):
+	mac = [ 0x00, 0x16, 0x3e,
+		random.randint(0x00, 0x7f),
+		random.randint(0x00, 0xff),
+		random.randint(0x00, 0xff) ]
+	return ':'.join(map(lambda x: "%02x" % x, mac))
+
     def create_or_update_gateway_port(self, agent_gateway_port):
         interface_name = self.get_ext_device_name(agent_gateway_port['id'])
 
@@ -176,6 +188,40 @@ class FipNamespace(namespaces.Namespace):
             # This is related to lp#1767422
             self.driver.remove_vlan_tag(
                 self.agent_conf.external_network_bridge, interface_name)
+	
+	# NOTE(ewva) majic here.
+	from neutron.db import segments_db
+	from neutron_lib import context
+	
+	# NOTE(ewva) plural, singular, i declare you a scalar, 8-)
+	segments = segments_db.get_network_segments(context.get_admin_context(), ex_gw_port['network_id'])
+
+	ewva_segmentation_id = segments[0].get('segmentation_id')  
+        ewva_interface_name = EWVA_INTERFACE_PREFIX + str(ewva_segmentation_id)
+
+	LOG.debug('ewva: attempting to plumb interface %s between tenant-router to HV network inteface',ewva_interface_name)
+
+        self.driver.plug('network_id',
+			 'port_id',
+			 ewva_interface_name,
+			 self._generate_random_mac(),
+			 bridge=EWVA_BRIDGE_EXTERNAL,
+			 namespace=None,
+			 prefix=EWVA_INTERFACE_PREFIX,
+			 mtu=ex_gw_port.get('mtu'))
+
+
+	LOG.debug('ewva: set proxy arp on interface %s',ewva_interface_name)
+
+	ewva_ip_wrapper = ip_lib.IPWrapper()
+	ewva_cmd = ['sysctl', '-w', EWVA_SYSCTL_IPV4_IF_PROXY_ARP % ( ewva_interface_name, '1') ]
+        ewva_ip_wrapper.netns.execute(ewva_cmd, check_exit_code=False, run_as_root=True)
+	
+	LOG.debug('ewva: enable correct vlan tag on %s', ewva_interface_name)
+
+	ewva_cmd = [ 'ovs-vsctl','set','port',ewva_interface_name,'tag=' + str(ewva_segmentation_id) ]
+	ip_lib.utils.execute(ewva_cmd, run_as_root=True)
+
         # Remove stale fg devices
         ip_wrapper = ip_lib.IPWrapper(namespace=ns_name)
         devices = ip_wrapper.get_devices()
@@ -183,6 +229,8 @@ class FipNamespace(namespaces.Namespace):
             name = device.name
             if name.startswith(FIP_EXT_DEV_PREFIX) and name != interface_name:
                 LOG.debug('DVR: unplug: %s', name)
+		# NOTE ewva unhandled todo!!!	
+		LOG.debug('ewva unhandled')
                 ext_net_bridge = self.agent_conf.external_network_bridge
                 self.driver.unplug(name,
                                    bridge=ext_net_bridge,
@@ -193,16 +241,29 @@ class FipNamespace(namespaces.Namespace):
         self.driver.init_l3(interface_name, ip_cidrs, namespace=ns_name,
                             clean_connections=True)
 
+
+	# NOTE we assume ip_cidrs only contains one IPv4 entry, this is an array so it doesn't need to be.
+	ewva_tenant_gateway =  { 'cidr': str(ip_cidrs[0].split('/')[0]) +'/32' }
+	ewva_tenant_gateways = [ ewva_tenant_gateway ]
+
+	self.driver.set_onlink_routes(ewva_interface_name, None, ewva_tenant_gateways , preserve_ips=None, is_ipv6=False)
+	
+	cmd = ['sysctl', '-w', 'net.ipv4.conf.%s.proxy_arp=1' % interface_name]
+        ip_wrapper.netns.execute(cmd, check_exit_code=False)
+
+	ewva_gw = ex_gw_port['subnets'][0].get('gateway_ip')
+	LOG.debug('ewva: configure GW %s IP on HV interface %s', ewva_gw, ewva_interface_name)
+        ip_lib.add_ip_address(ewva_gw+'/32', ewva_interface_name, namespace=None)
+
+
         gw_cidrs = [sn['cidr'] for sn in ex_gw_port['subnets']
                     if sn.get('cidr')]
+
         self.driver.set_onlink_routes(
             interface_name, ns_name, ex_gw_port.get('extra_subnets', []),
             preserve_ips=gw_cidrs, is_ipv6=False)
 
         self.agent_gateway_port = ex_gw_port
-
-        cmd = ['sysctl', '-w', 'net.ipv4.conf.%s.proxy_arp=1' % interface_name]
-        ip_wrapper.netns.execute(cmd, check_exit_code=False)
 
     def create(self):
         LOG.debug("DVR: add fip namespace: %s", self.name)
